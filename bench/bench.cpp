@@ -95,7 +95,7 @@ static BenchResult run_cuda(void* dst, const void* src,
 int main(int argc, char** argv)
 {
     int         gpu_id   = (argc > 1) ? std::atoi(argv[1]) : 0;
-    std::  nic_name = (argc > 2) ? argv[2]            : "mlx5_0";
+    std::string  nic_name = (argc > 2) ? argv[2]            : "mlx5_0";
 
     printf("=================================================================\n");
     printf("  GDR Copy Benchmark  —  GPU %d  NIC %s\n", gpu_id, nic_name.c_str());

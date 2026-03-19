@@ -79,6 +79,16 @@ static void check_cuda(cudaError_t e, const char* ctx) {
                                  cudaGetErrorString(e));
 }
 
+// Returns true only for host pointers allocated/registered as CUDA pinned memory.
+static bool is_cuda_pinned_host_ptr(const void* p) {
+    unsigned int flags = 0;
+    cudaError_t ce = cudaHostGetFlags(&flags, const_cast<void*>(p));
+    if (ce == cudaSuccess) return true;
+    // Clear error state from probing non-pinned pointers.
+    (void)cudaGetLastError();
+    return false;
+}
+
 // ── RC QP helpers ─────────────────────────────────────────────────────────────
 struct QPEndpoint {
     uint32_t qpn;
@@ -206,6 +216,7 @@ private:
 
     // GPU MR cache (addr+len → ibv_mr*)
     MRCache mr_cache_;
+    MRCache host_mr_cache_;
 
     // Pinned host buffer pool
     std::unique_ptr<PinnedPool> pool_;
@@ -228,6 +239,7 @@ private:
 
     // Internal helpers
     struct ibv_mr* get_gpu_mr(uint64_t gpu_va, size_t len);
+    struct ibv_mr* get_host_mr(uint64_t host_va, size_t len);
 
     int do_h2d(void* dst_gpu, const void* src_host, size_t bytes);
     int do_d2h(void*       dst_host, const void* src_gpu,  size_t bytes);
@@ -250,7 +262,8 @@ private:
 GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
                                        const std::string& nic_name,
                                        bool use_odp)
-    : mr_cache_(MR_CACHE_CAP), gpu_id_(gpu_id), nic_name_(nic_name)
+    : mr_cache_(MR_CACHE_CAP), host_mr_cache_(MR_CACHE_CAP),
+      gpu_id_(gpu_id), nic_name_(nic_name)
 {
     // ── 1. Set CUDA device ────────────────────────────────────────────────
     check_cuda(cudaSetDevice(gpu_id_), "cudaSetDevice");
@@ -377,6 +390,23 @@ struct ibv_mr* GDRCopyChannelImpl::get_gpu_mr(uint64_t gpu_va, size_t len) {
     return new_mr;
 }
 
+struct ibv_mr* GDRCopyChannelImpl::get_host_mr(uint64_t host_va, size_t len) {
+    struct ibv_mr* mr = host_mr_cache_.get(host_va, len);
+    if (mr) return mr;
+
+    struct ibv_mr* new_mr = ibv_reg_mr(pd_, reinterpret_cast<void*>(host_va),
+                                       len,
+                                       IBV_ACCESS_LOCAL_WRITE  |
+                                       IBV_ACCESS_REMOTE_WRITE |
+                                       IBV_ACCESS_REMOTE_READ);
+    if (!new_mr) return nullptr;
+
+    struct ibv_mr* evicted = host_mr_cache_.put(host_va, len, new_mr);
+    if (evicted) ibv_dereg_mr(evicted);
+
+    return new_mr;
+}
+
 // ── RDMA WRITE (H2D): pinned host → GPU ──────────────────────────────────────
 int GDRCopyChannelImpl::rdma_write(uint64_t remote_gpu_va, uint32_t rkey,
                                     uint64_t local_host_va, uint32_t lkey,
@@ -465,6 +495,31 @@ int GDRCopyChannelImpl::do_h2d(void* dst_gpu, const void* src_host, size_t bytes
     // Get / register GPU MR
     struct ibv_mr* gpu_mr = get_gpu_mr((uint64_t)dst_gpu, bytes);
 
+    // Fast path: only for CUDA pinned host pointers.
+    // This avoids paying ibv_reg_mr on every call for pageable malloc buffers.
+    struct ibv_mr* host_mr = nullptr;
+    if (is_cuda_pinned_host_ptr(src_host))
+        host_mr = get_host_mr((uint64_t)src_host, bytes);
+    if (host_mr) {
+        const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_host);
+        uint8_t*       dst8 = reinterpret_cast<uint8_t*>(dst_gpu);
+        size_t remaining = bytes;
+        size_t chunk_size = pool_->slot_size();
+
+        while (remaining > 0) {
+            size_t n = std::min(remaining, chunk_size);
+            int rc = rdma_write((uint64_t)dst8, gpu_mr->rkey,
+                                (uint64_t)src8, host_mr->lkey,
+                                n);
+            if (rc != 0) return -1;
+            src8      += n;
+            dst8      += n;
+            remaining -= n;
+        }
+        stats_.rdma_ops++;
+        return 0;
+    }
+
     // Chunk through pinned pool
     const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_host);
     uint8_t*       dst8 = reinterpret_cast<uint8_t*>(dst_gpu);
@@ -504,6 +559,30 @@ int GDRCopyChannelImpl::do_d2h(void* dst_host, const void* src_gpu, size_t bytes
     }
 
     struct ibv_mr* gpu_mr = get_gpu_mr((uint64_t)src_gpu, bytes);
+
+    // Fast path: only for CUDA pinned host pointers.
+    struct ibv_mr* host_mr = nullptr;
+    if (is_cuda_pinned_host_ptr(dst_host))
+        host_mr = get_host_mr((uint64_t)dst_host, bytes);
+    if (host_mr) {
+        uint8_t* dst8       = reinterpret_cast<uint8_t*>(dst_host);
+        const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_gpu);
+        size_t remaining = bytes;
+        size_t chunk_size = pool_->slot_size();
+
+        while (remaining > 0) {
+            size_t n = std::min(remaining, chunk_size);
+            int rc = rdma_read((uint64_t)dst8, host_mr->lkey,
+                               (uint64_t)src8, gpu_mr->rkey,
+                               n);
+            if (rc != 0) return -1;
+            dst8      += n;
+            src8      += n;
+            remaining -= n;
+        }
+        stats_.rdma_ops++;
+        return 0;
+    }
 
     uint8_t* dst8        = reinterpret_cast<uint8_t*>(dst_host);
     const uint8_t* src8  = reinterpret_cast<const uint8_t*>(src_gpu);

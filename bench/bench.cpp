@@ -139,11 +139,7 @@ int main(int argc, char** argv)
     for (size_t bytes : sizes) {
         void* h_src = nullptr;
         void* d_dst = nullptr;
-        h_src = std::malloc(bytes);
-        if (!h_src) {
-            fprintf(stderr, "malloc failed for H2D host buffer (%zu bytes)\n", bytes);
-            return 1;
-        }
+        cudaHostAlloc(&h_src, bytes, cudaHostAllocPortable);
         cudaMalloc(&d_dst, bytes);
         cudaMemset(d_dst, 0, bytes);
         memset(h_src, 0xAB, bytes);
@@ -162,7 +158,7 @@ int main(int argc, char** argv)
                gdr.median_us,  gdr.p99_us,  gdr.bw_GBs,
                cuda.median_us, cuda.p99_us, cuda.bw_GBs);
 
-        std::free(h_src);
+        cudaFreeHost(h_src);
         cudaFree(d_dst);
     }
 
@@ -185,12 +181,7 @@ int main(int argc, char** argv)
         void* d_src = nullptr;
         void* h_dst = nullptr;
         cudaMalloc(&d_src, bytes);
-        h_dst = std::malloc(bytes);
-        if (!h_dst) {
-            fprintf(stderr, "malloc failed for D2H host buffer (%zu bytes)\n", bytes);
-            cudaFree(d_src);
-            return 1;
-        }
+        cudaHostAlloc(&h_dst, bytes, cudaHostAllocPortable);
         cudaMemset(d_src, 0xCD, bytes);
         memset(h_dst, 0, bytes);
 
@@ -209,7 +200,7 @@ int main(int argc, char** argv)
                cuda.median_us, cuda.p99_us, cuda.bw_GBs);
 
         cudaFree(d_src);
-        std::free(h_dst);
+        cudaFreeHost(h_dst);
     }
 
     // ── Summary ───────────────────────────────────────────────────────────

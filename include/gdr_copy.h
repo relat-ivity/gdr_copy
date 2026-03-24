@@ -98,15 +98,15 @@ public:
 
     /**
      * poll_wc — non-blocking polling of one completion token.
-     * Returns 0 and sets req_id when one token is observed.
-     * Returns -EAGAIN when no completion is available yet.
+     * Returns 0 and sets req_id when one request is fully completed.
+     * Returns -EAGAIN when no request has completed yet.
      */
     virtual int poll_wc(uint64_t* req_id) = 0;
 
     /**
      * Non-blocking progress check for pending async operations.
-     * Returns 0 when one operation completion is observed.
-     * Returns -EAGAIN when no operation has completed yet.
+     * Returns 0 when one request completion is observed.
+     * Returns -EAGAIN when no request has completed yet.
      */
     virtual int sync() = 0;
 

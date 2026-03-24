@@ -63,8 +63,8 @@
 
 // ── compile-time tuning ───────────────────────────────────────────────────────
 static constexpr int    MR_CACHE_CAP  = 256;   // LRU entries for GPU MRs
-static constexpr int    CQ_DEPTH      = 128;
-static constexpr int    QP_MAX_WR     = 128;
+static constexpr int    CQ_DEPTH_TARGET = 1024;
+static constexpr int    QP_MAX_WR_TARGET = 1024;
 static constexpr int    MAX_POLL_US   = 5000;  // 5 ms poll timeout
 static constexpr int    IBV_PORT      = 1;
 
@@ -238,6 +238,9 @@ private:
     uint64_t submit_wr_id_ = 0;
     uint64_t next_wr_id_ = 1;
     int pending_wr_total_ = 0;
+    int cq_depth_ = CQ_DEPTH_TARGET;
+    int qp_max_wr_ = QP_MAX_WR_TARGET;
+    int wr_budget_ = QP_MAX_WR_TARGET;
     mutable std::mutex mtx_;
     GDRStats stats_{};
 
@@ -310,15 +313,29 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
     pd_ = ibv_alloc_pd(ctx_);
     if (!pd_) throw std::runtime_error("ibv_alloc_pd failed");
 
-    cq_ = ibv_create_cq(ctx_, CQ_DEPTH, nullptr, nullptr, 0);
+    struct ibv_device_attr dev_attr{};
+    if (ibv_query_device(ctx_, &dev_attr) != 0)
+        throw std::runtime_error("ibv_query_device failed");
+
+    int cq_depth_req = CQ_DEPTH_TARGET;
+    if (dev_attr.max_cqe > 0)
+        cq_depth_req = std::min(cq_depth_req, static_cast<int>(dev_attr.max_cqe));
+    if (cq_depth_req < 1) cq_depth_req = 1;
+
+    cq_ = ibv_create_cq(ctx_, cq_depth_req, nullptr, nullptr, 0);
     if (!cq_) throw std::runtime_error("ibv_create_cq failed");
+    cq_depth_ = cq_depth_req;
 
     // ── 4. Create loopback RC QP ─────────────────────────────────────────
     struct ibv_qp_init_attr qi{};
     qi.send_cq          = cq_;
     qi.recv_cq          = cq_;
-    qi.cap.max_send_wr  = QP_MAX_WR;
-    qi.cap.max_recv_wr  = QP_MAX_WR;
+    int qp_wr_req = QP_MAX_WR_TARGET;
+    if (dev_attr.max_qp_wr > 0)
+        qp_wr_req = std::min(qp_wr_req, static_cast<int>(dev_attr.max_qp_wr));
+    if (qp_wr_req < 1) qp_wr_req = 1;
+    qi.cap.max_send_wr  = qp_wr_req;
+    qi.cap.max_recv_wr  = qp_wr_req;
     qi.cap.max_send_sge = 1;
     qi.cap.max_recv_sge = 1;
     qi.cap.max_inline_data = 64;
@@ -327,6 +344,9 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
 
     qp_ = ibv_create_qp(pd_, &qi);
     if (!qp_) throw std::runtime_error("ibv_create_qp (RC) failed");
+    qp_max_wr_ = static_cast<int>(qi.cap.max_send_wr > 0 ? qi.cap.max_send_wr : qp_wr_req);
+    wr_budget_ = std::min(qp_max_wr_, cq_depth_ - 1);
+    if (wr_budget_ < 1) wr_budget_ = 1;
 
     QPEndpoint ep = query_ep(qp_, ctx_);
     // Loopback: remote endpoint == local endpoint
@@ -599,9 +619,9 @@ int GDRCopyChannelImpl::memcpy_async_tagged(void* dst, const void* src,
     if (is_rdma) {
         size_t chunk_size = pool_->slot_size();
         pending_wcs = static_cast<int>((bytes + chunk_size - 1) / chunk_size);
-        if (pending_wcs > QP_MAX_WR)
+        if (pending_wcs > wr_budget_)
             return -E2BIG;
-        if (pending_wr_total_ + pending_wcs > QP_MAX_WR)
+        if (pending_wr_total_ + pending_wcs > wr_budget_)
             return -EBUSY;
     }
 
@@ -701,7 +721,7 @@ int GDRCopyChannelImpl::poll_wc(uint64_t* req_id) {
 
         if (pending_wr_total_ > 0) pending_wr_total_--;
         if (it->pending_wcs > 0) it->pending_wcs--;
-        if (it->pending_wcs > 0) return 0;
+        if (it->pending_wcs > 0) return -EAGAIN;
         return finalize_op(it);
     }
 
@@ -722,11 +742,6 @@ int GDRCopyChannelImpl::poll_wc(uint64_t* req_id) {
 }
 
 int GDRCopyChannelImpl::sync() {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (async_ops_.empty()) return 0;
-    }
-
     uint64_t req_id = 0;
     int rc = poll_wc(&req_id);
     if (rc == -EAGAIN) {

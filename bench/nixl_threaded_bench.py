@@ -45,8 +45,18 @@ except ModuleNotFoundError as exc:
 
 try:
     import nixl._bindings as nixl
-except ModuleNotFoundError as exc:
-    _fail(f"NIXL Python bindings are required: {exc}")
+except ModuleNotFoundError:
+    try:
+        import nixl_cu12._bindings as nixl
+    except ModuleNotFoundError:
+        try:
+            import nixl_cu13._bindings as nixl
+        except ModuleNotFoundError as exc:
+            _fail(
+                "NIXL Python bindings are required. "
+                "Tried nixl._bindings, nixl_cu12._bindings, and nixl_cu13._bindings. "
+                f"Last error: {exc}"
+            )
 
 
 def now_us() -> float:

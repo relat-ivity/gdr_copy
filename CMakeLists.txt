@@ -150,8 +150,13 @@ set_target_properties(demo PROPERTIES
 
 # ── Executable: bench ─────────────────────────────────────────────────────────
 add_executable(bench bench/bench.cpp)
-target_link_libraries(bench PRIVATE gdr_copy_static ${NIXL_BENCH_TARGET})
+target_link_libraries(bench PRIVATE gdr_copy_static)
 set_target_properties(bench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
+
+add_executable(bench_nixl bench/bench_nixl.cpp)
+target_link_libraries(bench_nixl PRIVATE gdr_copy_static ${NIXL_BENCH_TARGET})
+set_target_properties(bench_nixl PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
 
 add_executable(bench_dual_gdr_h2d bench/bench_dual_gdr_h2d.cpp)

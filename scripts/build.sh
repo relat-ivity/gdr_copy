@@ -17,5 +17,3 @@ cmake --build "${BUILD}" --parallel $(nproc)
 
 echo ""
 echo "Build complete."
-echo "  Demo:  sudo ${BUILD}/demo [gpu_id] [nic_name]"
-echo "  Bench: sudo ${BUILD}/bench [gpu_id] [nic_name]"

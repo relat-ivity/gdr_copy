@@ -1,5 +1,5 @@
 /**
- * gdr_copy.cpp  —  GPUDirect RDMA Copy implementation
+ * gdr_copy.cpp  鈥? GPUDirect RDMA Copy implementation
  *
  * Key design decisions (and why the original code was wrong)
  * ----------------------------------------------------------
@@ -11,7 +11,7 @@
  * 2. GPU MR registration uses nvidia-peermem / nv_peer_mem kernel module.
  *    The NIC's ibv_reg_mr talks to the nvidia-peermem shim which pins the
  *    GPU physical pages behind the VA and returns a DMA-able PCI address.
- *    We do NOT manually compute BAR1 offsets — that only works for a very
+ *    We do NOT manually compute BAR1 offsets 鈥?that only works for a very
  *    specific driver+GPU combination and breaks across reboots.
  *    Instead: ibv_reg_mr(pd, gpu_va, len, IBV_ACCESS_LOCAL_WRITE |
  *                         IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ)
@@ -19,29 +19,27 @@
  *
  * 3. RC QP loopback: for a single-node H2D/D2H we connect a QP pair to
  *    itself (local QPN talks to local QPN).  This allows RDMA_WRITE from
- *    pinned-host → GPU and RDMA_READ from GPU → pinned-host using only the
+ *    host MR → GPU and RDMA_READ from GPU → host MR using only the
  *    NIC's DMA engine, with no CPU in the data path.
  *
  * 4. H2D path:
- *      a. Copy user src → pinned host slot  (memcpy, cacheable, fast)
- *      b. Post RDMA_WRITE: pinned-slot lkey → GPU rkey
- *      c. Poll CQ for completion
- *    Avoids a second GPU-side staging buffer.
+ *      a. Register / reuse user host MR
+ *      b. Register / reuse GPU MR
+ *      c. Post one RDMA_WRITE and poll CQ
  *
  * 5. D2H path:
- *      a. Post RDMA_READ: GPU rkey → pinned-slot lkey
- *      b. Poll CQ for completion
- *      c. Copy pinned host slot → user dst  (memcpy)
+ *      a. Register / reuse user host MR
+ *      b. Register / reuse GPU MR
+ *      c. Post one RDMA_READ and poll CQ
  *
- * 6. Chunking: large transfers are broken into POOL_SLOT_SIZE pieces so
- *    we never need more than one slot at a time.
+ * 6. No pinned pool and no per-request chunking:
+ *    one logical request maps to one RDMA WR / one WC.
  *
  * 7. Fallback: if GPU MR registration fails (nvidia-peermem absent),
  *    we transparently fall back to cudaMemcpy and track fallback_ops.
  */
 
 #include "gdr_copy.h"
-#include "pinned_pool.h"
 
 #include <infiniband/verbs.h>
 #include <cuda_runtime.h>
@@ -55,19 +53,20 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
-// ── compile-time tuning ───────────────────────────────────────────────────────
+// 鈹€鈹€ compile-time tuning 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 static constexpr int    CQ_DEPTH_TARGET = 5000;
 static constexpr int    QP_MAX_WR_TARGET = 30000;
 static constexpr int    QP_MAX_RECV_WR_TARGET = 100;
 static constexpr int    MAX_POLL_US   = 5000;  // 5 ms poll timeout
 static constexpr int    IBV_PORT      = 1;
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// 鈹€鈹€ helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 static inline double now_us() {
     using namespace std::chrono;
     return duration_cast<nanoseconds>(
@@ -81,7 +80,7 @@ static void check_cuda(cudaError_t e, const char* ctx) {
 }
 
 // Returns true only for host pointers allocated/registered as CUDA pinned memory.
-// ── RC QP helpers ─────────────────────────────────────────────────────────────
+// 鈹€鈹€ RC QP helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 struct QPEndpoint {
     uint32_t qpn;
     uint16_t lid;
@@ -100,14 +99,14 @@ static QPEndpoint query_ep(struct ibv_qp* qp, struct ibv_context* ctx) {
     ibv_query_port(ctx, IBV_PORT, &pattr);
     ep.lid = pattr.lid;
 
-    // GID index 0 — works for RoCE v2 (IPv6 GID) and InfiniBand
+    // GID index 0 鈥?works for RoCE v2 (IPv6 GID) and InfiniBand
     ibv_query_gid(ctx, IBV_PORT, 0,
                   reinterpret_cast<union ibv_gid*>(ep.gid));
     return ep;
 }
 
 /**
- * Transition an RC QP from RESET → INIT → RTR → RTS.
+ * Transition an RC QP from RESET 鈫?INIT 鈫?RTR 鈫?RTS.
  * remote: the QP endpoint we are connecting to (for loopback: same QP).
  * is_roce: if true use GID-based routing (RoCE v2); else LID (IB).
  */
@@ -116,7 +115,7 @@ static void connect_rc_qp(struct ibv_qp* qp,
                            const QPEndpoint& remote,
                            bool is_roce)
 {
-    // RESET → INIT
+    // RESET 鈫?INIT
     {
         struct ibv_qp_attr a{};
         a.qp_state        = IBV_QPS_INIT;
@@ -128,10 +127,10 @@ static void connect_rc_qp(struct ibv_qp* qp,
         if (ibv_modify_qp(qp, &a,
                 IBV_QP_STATE | IBV_QP_PKEY_INDEX |
                 IBV_QP_PORT  | IBV_QP_ACCESS_FLAGS) != 0)
-            throw std::runtime_error("QP RESET→INIT failed");
+            throw std::runtime_error("QP RESET鈫扞NIT failed");
     }
 
-    // INIT → RTR
+    // INIT 鈫?RTR
     {
         struct ibv_qp_attr a{};
         a.qp_state              = IBV_QPS_RTR;
@@ -160,10 +159,10 @@ static void connect_rc_qp(struct ibv_qp* qp,
                 IBV_QP_PATH_MTU           | IBV_QP_DEST_QPN        |
                 IBV_QP_RQ_PSN             | IBV_QP_MAX_DEST_RD_ATOMIC |
                 IBV_QP_MIN_RNR_TIMER) != 0)
-            throw std::runtime_error("QP INIT→RTR failed");
+            throw std::runtime_error("QP INIT鈫扲TR failed");
     }
 
-    // RTR → RTS
+    // RTR 鈫?RTS
     {
         struct ibv_qp_attr a{};
         a.qp_state      = IBV_QPS_RTS;
@@ -176,13 +175,13 @@ static void connect_rc_qp(struct ibv_qp* qp,
                 IBV_QP_STATE     | IBV_QP_TIMEOUT     |
                 IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY   |
                 IBV_QP_SQ_PSN    | IBV_QP_MAX_QP_RD_ATOMIC) != 0)
-            throw std::runtime_error("QP RTR→RTS failed");
+            throw std::runtime_error("QP RTR鈫扲TS failed");
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 // GDRCopyChannelImpl
-// ─────────────────────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 class GDRCopyChannelImpl : public GDRCopyChannel {
 public:
     GDRCopyChannelImpl(int gpu_id, const std::string& nic_name, bool use_odp);
@@ -195,6 +194,8 @@ public:
     int memcpy_async_tagged(void* dst, const void* src,
                             size_t bytes, GDRCopyKind kind,
                             uint64_t* req_id, int* expected_wcs) override;
+    int pin_host_window(void* ptr, size_t bytes) override;
+    int pin_gpu_window(void* ptr, size_t bytes) override;
     int poll_wc(uint64_t* req_id) override;
     int sync() override;
 
@@ -210,7 +211,7 @@ private:
     struct ibv_cq*           cq_   = nullptr;
     struct ibv_qp*           qp_   = nullptr;   // loopback RC QP
 
-    // 固定 MR window：后续请求只要落在这个区间内，就不再重复注册。
+    // 固定 MR window：后续请求只要仍落在这个区间内，就不再重复注册。
     struct RegisteredWindow {
         uint64_t base = 0;
         size_t len = 0;
@@ -219,8 +220,6 @@ private:
     RegisteredWindow gpu_window_;
     RegisteredWindow host_window_;
 
-    // Pinned host buffer pool
-    std::unique_ptr<PinnedPool> pool_;
 
     // Async state
     struct AsyncOp {
@@ -237,7 +236,7 @@ private:
 
     int      gpu_id_;
     std::string nic_name_;
-    bool     gdr_ok_  = false;   // false → fallback to cudaMemcpy
+    bool     gdr_ok_  = false;   // false 鈫?fallback to cudaMemcpy
     bool     is_roce_ = false;
     uint64_t submit_wr_id_ = 0;
     uint64_t next_wr_id_ = 1;
@@ -277,16 +276,16 @@ private:
 
 };
 
-// ── constructor ───────────────────────────────────────────────────────────────
+// 鈹€鈹€ constructor 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
                                        const std::string& nic_name,
                                        bool use_odp)
     : gpu_id_(gpu_id), nic_name_(nic_name)
 {
-    // ── 1. Set CUDA device ────────────────────────────────────────────────
+    // 鈹€鈹€ 1. Set CUDA device 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     check_cuda(cudaSetDevice(gpu_id_), "cudaSetDevice");
 
-    // ── 2. Open RDMA device ───────────────────────────────────────────────
+    // 鈹€鈹€ 2. Open RDMA device 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     int n_devs = 0;
     struct ibv_device** dev_list = ibv_get_device_list(&n_devs);
     if (!dev_list || n_devs == 0)
@@ -315,7 +314,7 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
     ibv_query_port(ctx_, IBV_PORT, &pattr);
     is_roce_ = (pattr.lid == 0);
 
-    // ── 3. Alloc PD, CQ ──────────────────────────────────────────────────
+    // 鈹€鈹€ 3. Alloc PD, CQ 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     pd_ = ibv_alloc_pd(ctx_);
     if (!pd_) throw std::runtime_error("ibv_alloc_pd failed");
 
@@ -332,7 +331,7 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
     if (!cq_) throw std::runtime_error("ibv_create_cq failed");
     cq_depth_ = cq_depth_req;
 
-    // ── 4. Create loopback RC QP ─────────────────────────────────────────
+    // 鈹€鈹€ 4. Create loopback RC QP 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     struct ibv_qp_init_attr qi{};
     qi.send_cq          = cq_;
     qi.recv_cq          = cq_;
@@ -354,7 +353,7 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
     qi.cap.max_send_sge = 1;
     qi.cap.max_recv_sge = 1;
     qi.cap.max_inline_data = 64;
-    qi.qp_type          = IBV_QPT_RC;   // ← MUST be RC for RDMA_WRITE/READ
+    qi.qp_type          = IBV_QPT_RC;   // 鈫?MUST be RC for RDMA_WRITE/READ
     qi.sq_sig_all       = 0;            // only signal when IBV_SEND_SIGNALED
 
     qp_ = ibv_create_qp(pd_, &qi);
@@ -367,14 +366,10 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
     // Loopback: remote endpoint == local endpoint
     connect_rc_qp(qp_, ep, ep, is_roce_);
 
-    // ── 5. Init pinned host pool ──────────────────────────────────────────
-    pool_ = std::make_unique<PinnedPool>(pd_);
-
-    // ── 6. Probe GPUDirect capability ────────────────────────────────────
+    // ── 5. Probe GPUDirect capability ─────────────────────────────────────
     // Allocate a tiny GPU buffer and try to register it with ibv_reg_mr.
     // If it succeeds, nvidia-peermem is present and GDR is available.
     void* probe_gpu = nullptr;
-    gdr_ok_ = false;
     if (cudaMalloc(&probe_gpu, 4096) == cudaSuccess) {
         int flags = IBV_ACCESS_LOCAL_WRITE |
                     IBV_ACCESS_REMOTE_WRITE |
@@ -389,20 +384,18 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
             std::cerr << "[gdr_copy] WARNING: ibv_reg_mr on GPU memory failed "
                          "(errno=" << errno << "). "
                          "Is nvidia-peermem / nv_peer_mem kernel module loaded?\n"
-                         "  → Falling back to cudaMemcpy for all transfers.\n";
+                         "  鈫?Falling back to cudaMemcpy for all transfers.\n";
         }
         cudaFree(probe_gpu);
     }
 }
 
-// ── destructor ────────────────────────────────────────────────────────────────
+// 鈹€鈹€ destructor 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 GDRCopyChannelImpl::~GDRCopyChannelImpl() {
     for (auto& op : async_ops_) {
         if (op.done_event) cudaEventDestroy(op.done_event);
     }
     async_ops_.clear();
-
-    pool_.reset();   // dereg pinned MRs before destroying PD
 
     if (gpu_window_.mr) {
         ibv_dereg_mr(gpu_window_.mr);
@@ -419,7 +412,7 @@ GDRCopyChannelImpl::~GDRCopyChannelImpl() {
     if (ctx_) ibv_close_device(ctx_);
 }
 
-// ── GPU MR registration ───────────────────────────────────────────────────────
+// 鈹€鈹€ GPU MR registration 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 struct ibv_mr* GDRCopyChannelImpl::ensure_window_mr(
     GDRCopyChannelImpl::RegisteredWindow& window,
     uint64_t addr, size_t len,
@@ -456,12 +449,12 @@ struct ibv_mr* GDRCopyChannelImpl::ensure_window_mr(
 }
 
 struct ibv_mr* GDRCopyChannelImpl::get_gpu_mr(uint64_t gpu_va, size_t len) {
-    // 只保留一个 GPU MR window；bench 会先用大块 buffer 预注册它。
+    // 鍙繚鐣欎竴涓?GPU MR window锛沚ench 浼氬厛鐢ㄥぇ鍧?buffer 棰勬敞鍐屽畠銆?
     return ensure_window_mr(gpu_window_, gpu_va, len, true);
 }
 
 struct ibv_mr* GDRCopyChannelImpl::get_host_mr(uint64_t host_va, size_t len) {
-    // host 侧同理，只维护一个覆盖当前工作区间的 MR。
+    // host 渚у悓鐞嗭紝鍙淮鎶や竴涓鐩栧綋鍓嶅伐浣滃尯闂寸殑 MR銆?
     try {
         return ensure_window_mr(host_window_, host_va, len, false);
     } catch (...) {
@@ -469,7 +462,30 @@ struct ibv_mr* GDRCopyChannelImpl::get_host_mr(uint64_t host_va, size_t len) {
     }
 }
 
-// ── RDMA WRITE (H2D): pinned host → GPU ──────────────────────────────────────
+int GDRCopyChannelImpl::pin_host_window(void* ptr, size_t bytes) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (bytes == 0)
+        return 0;
+    try {
+        return get_host_mr((uint64_t)ptr, bytes) ? 0 : -1;
+    } catch (...) {
+        return -1;
+    }
+}
+
+int GDRCopyChannelImpl::pin_gpu_window(void* ptr, size_t bytes) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (bytes == 0)
+        return 0;
+    if (!gdr_ok_)
+        return -1;
+    try {
+        return get_gpu_mr((uint64_t)ptr, bytes) ? 0 : -1;
+    } catch (...) {
+        return -1;
+    }
+}
+// 鈹€鈹€ RDMA WRITE (H2D): pinned host 鈫?GPU 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 int GDRCopyChannelImpl::rdma_write_post(uint64_t remote_gpu_va, uint32_t rkey,
                                         uint64_t local_host_va, uint32_t lkey,
                                         size_t   bytes, uint64_t wr_id)
@@ -477,7 +493,7 @@ int GDRCopyChannelImpl::rdma_write_post(uint64_t remote_gpu_va, uint32_t rkey,
     struct ibv_sge sge{};
     sge.addr   = local_host_va;
     sge.length = (uint32_t)bytes;
-    sge.lkey   = lkey;          // ← host-side MR lkey (registered via pd_)
+    sge.lkey   = lkey;          // 鈫?host-side MR lkey (registered via pd_)
 
     struct ibv_send_wr wr{};
     wr.wr_id                  = wr_id;
@@ -486,7 +502,7 @@ int GDRCopyChannelImpl::rdma_write_post(uint64_t remote_gpu_va, uint32_t rkey,
     wr.num_sge                = 1;
     wr.send_flags             = IBV_SEND_SIGNALED;
     wr.wr.rdma.remote_addr    = remote_gpu_va;   // GPU VA
-    wr.wr.rdma.rkey           = rkey;            // ← GPU-side MR rkey
+    wr.wr.rdma.rkey           = rkey;            // 鈫?GPU-side MR rkey
 
     struct ibv_send_wr* bad = nullptr;
     if (ibv_post_send(qp_, &wr, &bad) != 0)
@@ -503,7 +519,7 @@ int GDRCopyChannelImpl::rdma_write(uint64_t remote_gpu_va, uint32_t rkey,
                            submit_wr_id_);
 }
 
-// ── RDMA READ (D2H): GPU → pinned host ───────────────────────────────────────
+// 鈹€鈹€ RDMA READ (D2H): GPU 鈫?pinned host 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 int GDRCopyChannelImpl::rdma_read_post(uint64_t local_host_va, uint32_t lkey,
                                        uint64_t remote_gpu_va, uint32_t rkey,
                                        size_t   bytes, uint64_t wr_id)
@@ -537,10 +553,10 @@ int GDRCopyChannelImpl::rdma_read(uint64_t local_host_va, uint32_t lkey,
                           submit_wr_id_);
 }
 
-// ── CQ poll with timeout ──────────────────────────────────────────────────────
+// 鈹€鈹€ CQ poll with timeout 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
-// ── H2D ──────────────────────────────────────────────────────────────────────
+// 鈹€鈹€ H2D 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 int GDRCopyChannelImpl::do_h2d(void* dst_gpu, const void* src_host, size_t bytes)
 {
     if (!gdr_ok_) {
@@ -549,33 +565,15 @@ int GDRCopyChannelImpl::do_h2d(void* dst_gpu, const void* src_host, size_t bytes
         return (ce == cudaSuccess) ? 0 : -1;
     }
 
-    // Get / register GPU MR
     struct ibv_mr* gpu_mr = get_gpu_mr((uint64_t)dst_gpu, bytes);
-
-    // Always register/find host MR first (works for pinned and pageable memory).
     struct ibv_mr* host_mr = get_host_mr((uint64_t)src_host, bytes);
     if (!host_mr) return -1;
-    const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_host);
-    uint8_t*       dst8 = reinterpret_cast<uint8_t*>(dst_gpu);
-    size_t remaining = bytes;
-    size_t chunk_size = pool_->slot_size();
-
-    while (remaining > 0) {
-        size_t n = std::min(remaining, chunk_size);
-        int rc = rdma_write((uint64_t)dst8, gpu_mr->rkey,
-                            (uint64_t)src8, host_mr->lkey,
-                            n);
-        if (rc != 0) return -1;
-        src8      += n;
-        dst8      += n;
-        remaining -= n;
-    }
-    return 0;
-        // CPU copy: user src → pinned host (cache-coherent, fast)
-        // RDMA WRITE: pinned host → GPU (NIC DMA, no CPU involvement)
+    return rdma_write((uint64_t)dst_gpu, gpu_mr->rkey,
+                      (uint64_t)src_host, host_mr->lkey,
+                      bytes);
 }
 
-// ── D2H ──────────────────────────────────────────────────────────────────────
+// 鈹€鈹€ D2H 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 int GDRCopyChannelImpl::do_d2h(void* dst_host, const void* src_gpu, size_t bytes)
 {
     if (!gdr_ok_) {
@@ -585,39 +583,21 @@ int GDRCopyChannelImpl::do_d2h(void* dst_host, const void* src_gpu, size_t bytes
     }
 
     struct ibv_mr* gpu_mr = get_gpu_mr((uint64_t)src_gpu, bytes);
-
-    // Always register/find host MR first (works for pinned and pageable memory).
     struct ibv_mr* host_mr = get_host_mr((uint64_t)dst_host, bytes);
     if (!host_mr) return -1;
-    uint8_t* dst8       = reinterpret_cast<uint8_t*>(dst_host);
-    const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_gpu);
-    size_t remaining = bytes;
-    size_t chunk_size = pool_->slot_size();
-
-    while (remaining > 0) {
-        size_t n = std::min(remaining, chunk_size);
-        int rc = rdma_read((uint64_t)dst8, host_mr->lkey,
-                           (uint64_t)src8, gpu_mr->rkey,
-                           n);
-        if (rc != 0) return -1;
-        dst8      += n;
-        src8      += n;
-        remaining -= n;
-    }
-    return 0;
-
-        // RDMA READ: GPU → pinned host
-        // CPU copy: pinned host → user dst
+    return rdma_read((uint64_t)dst_host, host_mr->lkey,
+                     (uint64_t)src_gpu, gpu_mr->rkey,
+                     bytes);
 }
 
-// ── D2D ──────────────────────────────────────────────────────────────────────
+// 鈹€鈹€ D2D 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 int GDRCopyChannelImpl::do_d2d(void* dst_gpu, const void* src_gpu, size_t bytes) {
     cudaError_t ce = cudaMemcpyAsync(dst_gpu, src_gpu, bytes,
                                      cudaMemcpyDeviceToDevice, 0);
     return (ce == cudaSuccess) ? 0 : -1;
 }
 
-// ── public memcpy ─────────────────────────────────────────────────────────────
+// 鈹€鈹€ public memcpy 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 int GDRCopyChannelImpl::memcpy(void* dst, const void* src,
                                 size_t bytes, GDRCopyKind kind)
 {
@@ -625,7 +605,7 @@ int GDRCopyChannelImpl::memcpy(void* dst, const void* src,
     return memcpy_async(dst, src, bytes, kind);
 }
 
-// ── async (fire-and-forget, then sync) ───────────────────────────────────────
+// 鈹€鈹€ async (fire-and-forget, then sync) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 // Submit-only path: this call only posts work requests.
 // Completion is checked by poll_wc()/sync() in a non-blocking manner.
 int GDRCopyChannelImpl::memcpy_async(void* dst, const void* src,
@@ -645,8 +625,9 @@ int GDRCopyChannelImpl::memcpy_async_tagged(void* dst, const void* src,
     bool is_rdma = gdr_ok_ && (kind == GDR_H2D || kind == GDR_D2H);
     int pending_wcs = 0;
     if (is_rdma) {
-        size_t chunk_size = pool_->slot_size();
-        pending_wcs = static_cast<int>((bytes + chunk_size - 1) / chunk_size);
+        if (bytes > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+            return -E2BIG;
+        pending_wcs = 1;
         if (pending_wcs > wr_budget_)
             return -E2BIG;
         if (pending_wr_total_ + pending_wcs > wr_budget_)
@@ -779,9 +760,9 @@ int GDRCopyChannelImpl::sync() {
     return rc;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 // GDRCopyLib factory
-// ─────────────────────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 static std::mutex                                              g_lib_mtx;
 static std::map<std::pair<int,std::string>,
                 std::shared_ptr<GDRCopyChannel>>              g_channels;

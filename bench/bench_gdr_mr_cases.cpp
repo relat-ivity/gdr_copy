@@ -9,7 +9,8 @@
  *   1. GPU address is outside the pinned GPU MR window:
  *      use a GPU staging MR buffer and one extra D2D copy.
  *   2. GPU address is outside the staging MR buffer:
- *      pin the actual GPU buffer once via ibv_reg_mr and then GDR directly.
+ *      re-register the actual GPU buffer via ibv_reg_mr on every transfer,
+ *      then GDR directly.
  *   3. Pin a 20 GiB HBM region as the GPU MR window and measure transfers
  *      whose GPU address falls inside that 20 GiB region.
  *
@@ -42,7 +43,7 @@ static constexpr size_t HBM_MR_OFFSET = 8ULL  << 30;  // use an interior address
 struct CaseRow {
     size_t bytes = 0;
     double staged_bw = 0.0;
-    double reg_once_bw = 0.0;
+    double reg_each_bw = 0.0;
     double hbm20_bw = -1.0;  // <0 means N/A
 };
 
@@ -203,6 +204,40 @@ static double run_direct_gdr_bw(const std::shared_ptr<GDRCopyChannel>& ch,
              : 0.0;
 }
 
+static double run_reg_each_gdr_bw(const std::shared_ptr<GDRCopyChannel>& ch,
+                                  void* dst, const void* src, void* gpu_ptr,
+                                  size_t bytes, GDRCopyKind kind,
+                                  int warmup, int iters, const char* label)
+{
+    auto one_iter = [&]() {
+        // This case intentionally destroys and recreates the GPU MR on every
+        // transfer, so we must keep one request in flight at a time.
+        if (ch->clear_gpu_window() != 0) {
+            fprintf(stderr, "[mr-cases] clear_gpu_window failed: case=%s bytes=%zu\n",
+                    label, bytes);
+            std::exit(2);
+        }
+        if (ch->pin_gpu_window(gpu_ptr, bytes) != 0) {
+            fprintf(stderr, "[mr-cases] pin_gpu_window failed: case=%s bytes=%zu\n",
+                    label, bytes);
+            std::exit(2);
+        }
+        submit_one_gdr_and_wait(ch, dst, src, bytes, kind, label);
+    };
+
+    for (int i = 0; i < warmup; ++i)
+        one_iter();
+
+    double t0 = now_us();
+    for (int i = 0; i < iters; ++i)
+        one_iter();
+    double total_us = now_us() - t0;
+
+    return (iters > 0 && total_us > 0.0)
+             ? ((double)bytes * (double)iters / 1e9) / (total_us / 1e6)
+             : 0.0;
+}
+
 static double run_staged_h2d_bw(const std::shared_ptr<GDRCopyChannel>& ch,
                                 void* actual_gpu, void* stage_gpu, const void* host_src,
                                 size_t bytes, int warmup, int iters,
@@ -276,7 +311,7 @@ static double run_staged_d2h_bw(const std::shared_ptr<GDRCopyChannel>& ch,
 static void print_case_table(const char* title, const std::vector<CaseRow>& rows) {
     printf("\n--- %s ---\n", title);
     printf("%-12s | %-18s | %-18s | %-18s\n",
-           "Size", "stage->MR->GDR", "reg-once+GDR", "20GB-MR+GDR");
+           "Size", "stage->MR->GDR", "reg-each+GDR", "20GB-MR+GDR");
     printf("%-12s-+-%-18s-+-%-18s-+-%-18s\n",
            "------------", "------------------", "------------------", "------------------");
 
@@ -285,10 +320,10 @@ static void print_case_table(const char* title, const std::vector<CaseRow>& rows
         format_size(row.bytes, size_str, sizeof(size_str));
         if (row.hbm20_bw >= 0.0) {
             printf("%-12s | %8.2f GB/s      | %8.2f GB/s      | %8.2f GB/s      \n",
-                   size_str, row.staged_bw, row.reg_once_bw, row.hbm20_bw);
+                   size_str, row.staged_bw, row.reg_each_bw, row.hbm20_bw);
         } else {
             printf("%-12s | %8.2f GB/s      | %8.2f GB/s      | %8s          \n",
-                   size_str, row.staged_bw, row.reg_once_bw, "N/A");
+                   size_str, row.staged_bw, row.reg_each_bw, "N/A");
         }
     }
 }
@@ -343,10 +378,15 @@ static std::vector<CaseRow> run_h2d_suite(int gpu_id, const std::string& nic_nam
 
     {
         auto ch = reopen_channel(gpu_id, nic_name);
-        pin_windows_or_die(ch, host_src, max_bytes, gpu_actual, max_bytes, "h2d_reg_once");
+        if (ch->pin_host_window(host_src, max_bytes) != 0) {
+            fprintf(stderr, "[mr-cases] pin_host_window failed: case=%s bytes=%zu\n",
+                    "h2d_reg_each", max_bytes);
+            std::exit(2);
+        }
         for (size_t i = 0; i < sizes.size(); ++i) {
-            rows[i].reg_once_bw = run_direct_gdr_bw(ch, gpu_actual, host_src, sizes[i],
-                                                    GDR_H2D, WARMUP, ITERS, "h2d_reg_once");
+            rows[i].reg_each_bw = run_reg_each_gdr_bw(ch, gpu_actual, host_src, gpu_actual,
+                                                      sizes[i], GDR_H2D, WARMUP, ITERS,
+                                                      "h2d_reg_each");
         }
     }
 
@@ -406,10 +446,15 @@ static std::vector<CaseRow> run_d2h_suite(int gpu_id, const std::string& nic_nam
 
     {
         auto ch = reopen_channel(gpu_id, nic_name);
-        pin_windows_or_die(ch, host_dst, max_bytes, gpu_actual, max_bytes, "d2h_reg_once");
+        if (ch->pin_host_window(host_dst, max_bytes) != 0) {
+            fprintf(stderr, "[mr-cases] pin_host_window failed: case=%s bytes=%zu\n",
+                    "d2h_reg_each", max_bytes);
+            std::exit(2);
+        }
         for (size_t i = 0; i < sizes.size(); ++i) {
-            rows[i].reg_once_bw = run_direct_gdr_bw(ch, host_dst, gpu_actual, sizes[i],
-                                                    GDR_D2H, WARMUP, ITERS, "d2h_reg_once");
+            rows[i].reg_each_bw = run_reg_each_gdr_bw(ch, host_dst, gpu_actual, gpu_actual,
+                                                      sizes[i], GDR_D2H, WARMUP, ITERS,
+                                                      "d2h_reg_each");
         }
     }
 

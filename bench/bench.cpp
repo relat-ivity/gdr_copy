@@ -322,7 +322,7 @@ int main(int argc, char** argv)
     const size_t max_bytes = sizes.back();
 
     static const int WARMUP = 100;
-    static const int ITERS  = 10000;
+    static const int ITERS  = 1000;
 
     // 输出异步下发时延和带宽。
     cudaStream_t issue_stream{};

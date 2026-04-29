@@ -169,6 +169,11 @@ target_link_libraries(bench_gdr_mr_cases PRIVATE gdr_copy_static)
 set_target_properties(bench_gdr_mr_cases PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
 
+add_executable(bench_gdr_full_gpu_mr bench/bench_gdr_full_gpu_mr.cpp)
+target_link_libraries(bench_gdr_full_gpu_mr PRIVATE gdr_copy_static)
+set_target_properties(bench_gdr_full_gpu_mr PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS gdr_copy_static DESTINATION lib)
 install(FILES include/gdr_copy.h DESTINATION include)
